@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chats</title>
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <section id="auth-view" class="auth" hidden>
+    <form id="login-form" class="card" autocomplete="on">
+      <h1>Sign in</h1>
+      <label>Login <input name="login" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <p class="error" data-error></p>
+      <div class="row">
+        <button type="submit">Sign in</button>
+        <button type="button" class="secondary" data-show="register">Register</button>
+      </div>
+    </form>
+    <form id="register-form" class="card" autocomplete="on" hidden>
+      <h1>Create account</h1>
+      <label>Login <input name="login" autocomplete="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_]+"></label>
+      <label>Password <input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
+      <label>Repeat password <input name="repeat" type="password" autocomplete="new-password" required></label>
+      <p class="error" data-error></p>
+      <div class="row">
+        <button type="submit">Create account</button>
+        <button type="button" class="secondary" data-show="login">Back to sign in</button>
+      </div>
+    </form>
+  </section>
+
+  <div id="main-view" class="layout" hidden>
+    <aside class="sidebar">
+      <header class="bar">
+        <a href="#/" class="brand">Chats</a>
+        <span id="me" class="muted"></span>
+        <button id="new-chat-btn" type="button">+ New chat</button>
+        <button id="logout-btn" type="button" class="secondary">Log out</button>
+      </header>
+      <p id="notice" class="notice" hidden></p>
+      <section>
+        <h2>My chats</h2>
+        <ul id="my-chats" class="chat-list"></ul>
+      </section>
+      <section>
+        <h2>Top groups</h2>
+        <ol id="top-groups" class="chat-list"></ol>
+      </section>
+      <section>
+        <h2>Top channels</h2>
+        <ol id="top-channels" class="chat-list"></ol>
+      </section>
+    </aside>
+
+    <main id="chat-pane" class="chat-pane">
+      <div id="chat-empty" class="empty muted">Pick a chat or create a new one.</div>
+      <div id="chat-view" class="chat" hidden>
+        <header class="bar chat-head">
+          <div>
+            <h2 id="chat-title"></h2>
+            <span id="chat-meta" class="muted"></span>
+          </div>
+          <div class="row">
+            <button id="join-btn" type="button" hidden>Join</button>
+            <button id="leave-btn" type="button" class="secondary" hidden>Leave</button>
+            <button id="delete-btn" type="button" class="danger" hidden>Delete</button>
+          </div>
+        </header>
+        <div id="messages" class="messages">
+          <div id="top-sentinel" class="sentinel"></div>
+          <ul id="message-list"></ul>
+        </div>
+        <form id="send-form" class="send" hidden>
+          <textarea name="body" rows="2" maxlength="4000" placeholder="Write a message... (Enter to send, Shift+Enter for a new line)" required></textarea>
+          <button type="submit">Send</button>
+        </form>
+        <p id="read-only" class="muted read-only" hidden>Only the channel owner can post here.</p>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="new-chat-dialog">
+    <form id="new-chat-form" method="dialog" class="card">
+      <h2>New chat</h2>
+      <label>Title <input name="title" required maxlength="100"></label>
+      <fieldset>
+        <legend>Kind</legend>
+        <label><input type="radio" name="kind" value="group" checked> Group: members can post (up to 1,000)</label>
+        <label><input type="radio" name="kind" value="channel"> Channel: only you can post (up to 10,000)</label>
+      </fieldset>
+      <p class="error" data-error></p>
+      <div class="row">
+        <button type="submit" value="create">Create</button>
+        <button type="button" class="secondary" data-close>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
