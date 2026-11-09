@@ -62,6 +62,7 @@ async fn run(app: App, user_id: i64, mut socket: WebSocket) {
 
     let mut open: Option<Open> = None;
     loop {
+        let was_open = open.is_some();
         let out = tokio::select! {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientFrame>(&text) {
@@ -90,6 +91,7 @@ async fn run(app: App, user_id: i64, mut socket: WebSocket) {
                     // Drop whatever is still queued and let the client refetch.
                     let o = open.as_mut().expect("lagged implies open");
                     o.rx = o.rx.resubscribe();
+                    app.hub.note_resync();
                     Some(json!({ "t": "resync", "chat": o.chat }).to_string().into())
                 }
                 Live::Closed => {
@@ -102,11 +104,19 @@ async fn run(app: App, user_id: i64, mut socket: WebSocket) {
                 None => break, // dropped by the hub as too slow
             },
         };
+        match (was_open, open.is_some()) {
+            (false, true) => app.hub.note_subscription(1),
+            (true, false) => app.hub.note_subscription(-1),
+            _ => {}
+        }
         if let Some(frame) = out
             && socket.send(Message::Text(frame)).await.is_err()
         {
             break;
         }
+    }
+    if open.is_some() {
+        app.hub.note_subscription(-1);
     }
     app.hub.disconnect(user_id, conn_id);
 }

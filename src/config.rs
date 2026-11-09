@@ -1,13 +1,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: chats-openspec [--addr HOST:PORT] [--data-dir DIR] [--static-dir DIR] [--shards N]
+pub const USAGE: &str = "usage: chats-openspec [--addr HOST:PORT] [--data-dir DIR] [--static-dir DIR] [--shards N] [--metrics]
 
   --addr        listen address            (env CHATS_ADDR,       default 127.0.0.1:8080)
   --data-dir    SQLite files directory    (env CHATS_DATA_DIR,   default ./data)
   --static-dir  static files directory    (env CHATS_STATIC_DIR, default <exe dir>/static or ./static)
   --shards      message shard count, used only when the database is first created
-                                          (env CHATS_SHARDS,     default 32)";
+                                          (env CHATS_SHARDS,     default 32)
+  --metrics     serve GET /api/metrics without auth (env CHATS_METRICS=1, default off)";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,6 +17,8 @@ pub struct Config {
     pub static_dir: PathBuf,
     /// `None` means "use the stored count, or the default on first start".
     pub shards: Option<u32>,
+    /// Serves `GET /api/metrics` when set.
+    pub metrics: bool,
 }
 
 impl Config {
@@ -33,6 +36,7 @@ impl Config {
         let mut data_dir = env("CHATS_DATA_DIR");
         let mut static_dir = env("CHATS_STATIC_DIR");
         let mut shards = env("CHATS_SHARDS");
+        let mut metrics = matches!(env("CHATS_METRICS").as_deref(), Some("1" | "true"));
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -40,6 +44,10 @@ impl Config {
                 Some((k, v)) => (k.to_string(), Some(v.to_string())),
                 None => (arg.clone(), None),
             };
+            if key == "--metrics" && inline.is_none() {
+                metrics = true;
+                continue;
+            }
             let slot = match key.as_str() {
                 "--addr" => &mut addr,
                 "--data-dir" => &mut data_dir,
@@ -72,6 +80,7 @@ impl Config {
             data_dir: data_dir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data")),
             static_dir: static_dir.map(PathBuf::from).unwrap_or_else(default_static_dir),
             shards,
+            metrics,
         })
     }
 }
@@ -102,6 +111,17 @@ mod tests {
         assert_eq!(c.addr.to_string(), "127.0.0.1:8080");
         assert_eq!(c.data_dir, PathBuf::from("data"));
         assert_eq!(c.shards, None);
+        assert!(!c.metrics);
+    }
+
+    #[test]
+    fn metrics_flag_and_env() {
+        assert!(Config::parse(args(&["--metrics"]), |_| None).unwrap().metrics);
+        let env = |k: &str| (k == "CHATS_METRICS").then(|| "1".to_string());
+        assert!(Config::parse(args(&[]), env).unwrap().metrics);
+        let off = |k: &str| (k == "CHATS_METRICS").then(|| "0".to_string());
+        assert!(!Config::parse(args(&[]), off).unwrap().metrics);
+        assert!(Config::parse(args(&["--metrics=1"]), |_| None).is_err(), "the flag takes no value");
     }
 
     #[test]

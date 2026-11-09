@@ -80,6 +80,35 @@ pub struct Top {
     pub channels: Vec<ChatBrief>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct OnlineChat {
+    pub id: i64,
+    pub online: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct PerKind<T> {
+    pub group: T,
+    pub channel: T,
+}
+
+impl<T> PerKind<T> {
+    fn get_mut(&mut self, kind: Kind) -> &mut T {
+        match kind {
+            Kind::Group => &mut self.group,
+            Kind::Channel => &mut self.channel,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ChatStats {
+    pub groups: usize,
+    pub channels: usize,
+    pub max_members: PerKind<i64>,
+    pub max_online: PerKind<Option<OnlineChat>>,
+}
+
 struct OnlineUser {
     conns: Vec<(u64, mpsc::Sender<Utf8Bytes>)>,
     chats: HashSet<i64>,
@@ -96,6 +125,18 @@ pub struct Hub {
     chat_online: DashMap<i64, HashSet<i64>>,
     dirty: Mutex<HashSet<i64>>,
     next_conn: AtomicU64,
+    open_subscriptions: AtomicI64,
+    resyncs_total: AtomicU64,
+    dropped_slow_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct WsStats {
+    pub connections: usize,
+    pub online_users: usize,
+    pub open_subscriptions: i64,
+    pub resyncs_total: u64,
+    pub dropped_slow_total: u64,
 }
 
 impl Hub {
@@ -109,6 +150,9 @@ impl Hub {
             chat_online: DashMap::new(),
             dirty: Mutex::new(HashSet::new()),
             next_conn: AtomicU64::new(1),
+            open_subscriptions: AtomicI64::new(0),
+            resyncs_total: AtomicU64::new(0),
+            dropped_slow_total: AtomicU64::new(0),
         })
     }
 
@@ -154,6 +198,30 @@ impl Hub {
             }
             self.send_control(user, frame.clone());
         }
+    }
+
+    /// Counts and largest chats by kind; one pass over chats and one over
+    /// the online index.
+    pub fn chat_stats(&self) -> ChatStats {
+        let mut stats = ChatStats::default();
+        for chat in self.chats.iter() {
+            match chat.kind {
+                Kind::Group => stats.groups += 1,
+                Kind::Channel => stats.channels += 1,
+            }
+            let max = stats.max_members.get_mut(chat.kind);
+            *max = (*max).max(chat.member_count());
+        }
+        // Collected first so no `chat_online` guard is held while reading `chats`.
+        let sizes: Vec<(i64, usize)> = self.chat_online.iter().map(|e| (*e.key(), e.value().len())).collect();
+        for (chat_id, online) in sizes {
+            let Some(kind) = self.chats.get(&chat_id).map(|c| c.kind) else { continue };
+            let best = stats.max_online.get_mut(kind);
+            if online > 0 && best.is_none_or(|b| online > b.online) {
+                *best = Some(OnlineChat { id: chat_id, online });
+            }
+        }
+        stats
     }
 
     // ---- logins ----
@@ -284,8 +352,28 @@ impl Hub {
                 .collect()
         };
         if !stale.is_empty() {
+            self.dropped_slow_total.fetch_add(stale.len() as u64, Ordering::Relaxed);
             tracing::debug!("dropping {} slow connection(s) of user {user_id}", stale.len());
             self.drop_conns(user_id, &stale);
+        }
+    }
+
+    /// Tracks connections that have a chat open (`+1` on open, `-1` on close).
+    pub fn note_subscription(&self, delta: i64) {
+        self.open_subscriptions.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    pub fn note_resync(&self) {
+        self.resyncs_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn ws_stats(&self) -> WsStats {
+        WsStats {
+            connections: self.online.iter().map(|o| o.conns.len()).sum(),
+            online_users: self.online.len(),
+            open_subscriptions: self.open_subscriptions.load(Ordering::Relaxed),
+            resyncs_total: self.resyncs_total.load(Ordering::Relaxed),
+            dropped_slow_total: self.dropped_slow_total.load(Ordering::Relaxed),
         }
     }
 
@@ -417,6 +505,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_stats_by_kind() {
+        let (_d, hub, _conn) = hub_with_db();
+        assert_eq!(hub.chat_stats(), ChatStats::default());
+        hub.insert_chat(ChatState::new(row(1, Kind::Group, 3), 0));
+        hub.insert_chat(ChatState::new(row(2, Kind::Group, 7), 0));
+        hub.insert_chat(ChatState::new(row(9, Kind::Channel, 5), 0));
+        hub.insert_chat(ChatState::new(row(10, Kind::Channel, 4), 0));
+        let mut queues = Vec::new(); // keeps each connection's queue open
+        for user in 1..=4 {
+            let (tx, rx) = mpsc::channel(CONTROL_CAPACITY);
+            queues.push(rx);
+            hub.connect(user, tx);
+            hub.add_user_chats(user, &[9]);
+        }
+        hub.add_user_chats(1, &[10, 2]);
+        let s = hub.chat_stats();
+        assert_eq!((s.groups, s.channels), (2, 2));
+        assert_eq!(s.max_members, PerKind { group: 7, channel: 5 });
+        assert_eq!(s.max_online.channel, Some(OnlineChat { id: 9, online: 4 }));
+        assert_eq!(s.max_online.group, Some(OnlineChat { id: 2, online: 1 }));
+
+        hub.remove_chat(1);
+        assert_eq!(hub.chat_stats().groups, 1);
+    }
+
+    /// Run with: cargo test --release --lib metrics_scale -- --ignored
+    #[tokio::test]
+    #[ignore = "timing check; meaningful only in release builds"]
+    async fn metrics_scale_with_100k_chats() {
+        let (_d, hub, _conn) = hub_with_db();
+        for id in 1..=100_000 {
+            let kind = if id % 5 == 0 { Kind::Channel } else { Kind::Group };
+            hub.insert_chat(ChatState::new(row(id, kind, id % 1000), 0));
+        }
+        let mut queues = Vec::new();
+        for user in 1..=10_000 {
+            let (tx, rx) = mpsc::channel(CONTROL_CAPACITY);
+            queues.push(rx);
+            hub.connect(user, tx);
+            hub.add_user_chats(user, &[user % 20_000 + 1, user % 7 + 1]);
+        }
+        let start = std::time::Instant::now();
+        let body = serde_json::to_string(&json!({ "ws": hub.ws_stats(), "chats": hub.chat_stats() })).unwrap();
+        let took = start.elapsed();
+        println!("metrics over 100k chats: {took:?} ({} bytes)", body.len());
+        assert!(took < Duration::from_millis(50), "took {took:?}");
+    }
+
+    #[tokio::test]
     async fn live_frames_reach_subscribers() {
         let (_d, hub, _conn) = hub_with_db();
         hub.insert_chat(ChatState::new(row(5, Kind::Group, 1), 0));
@@ -444,6 +581,8 @@ mod tests {
         }
         assert!(!hub.is_connected(1, slow));
         assert!(hub.is_connected(1, fast));
+        let stats = hub.ws_stats();
+        assert_eq!((stats.connections, stats.online_users, stats.dropped_slow_total), (1, 1, 1));
         hub.send_control(1, Utf8Bytes::from_static("still here"));
         assert_eq!(fast_rx.try_recv().unwrap().as_str(), "still here");
     }

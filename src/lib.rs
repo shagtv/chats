@@ -43,7 +43,7 @@ pub async fn start(config: Config) -> Result<Running, BoxError> {
 
     let listener = TcpListener::bind(config.addr).await?;
     let addr = listener.local_addr()?;
-    let router = api::router(app.clone(), &config.static_dir);
+    let router = api::router(app.clone(), &config.static_dir, config.metrics);
     let (shutdown, rx) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         axum::serve(listener, router)

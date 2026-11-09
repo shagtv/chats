@@ -178,6 +178,8 @@ async fn slow_reader_gets_resync_without_slowing_others() {
         }
     }
     assert!(got_resync, "slow reader should be told to resync");
+    let m = s.metrics().await;
+    assert!(m["ws"]["resyncs_total"].as_u64().unwrap() >= 1, "resyncs are counted: {m}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

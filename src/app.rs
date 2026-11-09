@@ -1,7 +1,9 @@
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::api::HttpStats;
 use crate::auth::Auth;
 use crate::config::Config;
 use crate::db::meta::{self, MetaCmd, MetaHandler};
@@ -39,6 +41,8 @@ pub struct AppInner {
     pub hub: Arc<Hub>,
     pub db: Db,
     pub auth: Auth,
+    pub http: Arc<HttpStats>,
+    pub started: Instant,
 }
 
 #[derive(Clone)]
@@ -91,5 +95,11 @@ fn open_blocking(data_dir: &Path, requested_shards: Option<u32>) -> Result<App, 
     let meta = Writer::spawn("meta", meta_conn, MetaHandler)?;
     tracing::info!("opened {} with {shard_count} shards and {} chats", data_dir.display(), hub.chat_count());
 
-    Ok(App(Arc::new(AppInner { hub, db: Db { meta, meta_pool, shards }, auth: Auth::new() })))
+    Ok(App(Arc::new(AppInner {
+        hub,
+        db: Db { meta, meta_pool, shards },
+        auth: Auth::new(),
+        http: Arc::default(),
+        started: Instant::now(),
+    })))
 }

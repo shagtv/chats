@@ -73,6 +73,7 @@ enum Envelope<C> {
 pub struct Writer<C> {
     tx: mpsc::Sender<Envelope<C>>,
     commits: Arc<AtomicU64>,
+    cmds: Arc<AtomicU64>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -80,11 +81,12 @@ impl<C: Send + 'static> Writer<C> {
     pub fn spawn<H: Handler<Cmd = C>>(name: &str, conn: Connection, handler: H) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let commits = Arc::new(AtomicU64::new(0));
-        let counter = commits.clone();
+        let cmds = Arc::new(AtomicU64::new(0));
+        let counters = (commits.clone(), cmds.clone());
         let thread = std::thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || run(conn, handler, rx, &counter))?;
-        Ok(Self { tx, commits, thread: Mutex::new(Some(thread)) })
+            .spawn(move || run(conn, handler, rx, &counters.0, &counters.1))?;
+        Ok(Self { tx, commits, cmds, thread: Mutex::new(Some(thread)) })
     }
 
     /// Queues a command; waits only if the queue is full.
@@ -103,6 +105,16 @@ impl<C: Send + 'static> Writer<C> {
         self.commits.load(Ordering::Relaxed)
     }
 
+    /// Commands handled so far, committed or not.
+    pub fn cmds(&self) -> u64 {
+        self.cmds.load(Ordering::Relaxed)
+    }
+
+    /// Commands waiting in the queue.
+    pub fn queue(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
+
     /// Lets the thread finish everything queued so far, then joins it.
     pub async fn stop(&self) {
         let _ = self.tx.send(Envelope::Stop).await;
@@ -113,7 +125,13 @@ impl<C: Send + 'static> Writer<C> {
     }
 }
 
-fn run<H: Handler>(conn: Connection, mut handler: H, mut rx: mpsc::Receiver<Envelope<H::Cmd>>, commits: &AtomicU64) {
+fn run<H: Handler>(
+    conn: Connection,
+    mut handler: H,
+    mut rx: mpsc::Receiver<Envelope<H::Cmd>>,
+    commits: &AtomicU64,
+    cmds: &AtomicU64,
+) {
     let mut batch = Vec::with_capacity(MAX_BATCH);
     let mut stopping = false;
     loop {
@@ -144,6 +162,7 @@ fn run<H: Handler>(conn: Connection, mut handler: H, mut rx: mpsc::Receiver<Enve
             }
         }
         if !batch.is_empty() {
+            cmds.fetch_add(batch.len() as u64, Ordering::Relaxed);
             run_batch(&conn, &mut handler, batch.drain(..), commits);
         }
         if stopping {
@@ -280,6 +299,8 @@ mod tests {
             t.await.unwrap().unwrap();
         }
         assert_eq!(count(&path), 1000);
+        assert_eq!(w.cmds(), 1000);
+        assert_eq!(w.queue(), 0, "nothing waits once every reply is in");
         let commits = w.commits();
         assert!(commits < 500, "expected batching, got {commits} commits for 1000 commands");
         w.stop().await;

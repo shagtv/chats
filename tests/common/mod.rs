@@ -31,13 +31,26 @@ impl Server {
         s
     }
 
+    /// Starts without `--metrics`.
+    pub async fn start_without_metrics() -> Server {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Server::start_with(tmp.path(), false).await;
+        s._tmp = Some(tmp);
+        s
+    }
+
     /// Starts on an existing data dir (the caller keeps it alive).
     pub async fn start_in(data_dir: &Path) -> Server {
+        Server::start_with(data_dir, true).await
+    }
+
+    pub async fn start_with(data_dir: &Path, metrics: bool) -> Server {
         let config = Config {
             addr: "127.0.0.1:0".parse().unwrap(),
             data_dir: data_dir.to_path_buf(),
             static_dir: static_dir(),
             shards: Some(4),
+            metrics,
         };
         let running = start(config).await.unwrap();
         let base = format!("http://{}", running.addr);
@@ -48,6 +61,12 @@ impl Server {
         if let Some(r) = self.running.take() {
             r.stop().await;
         }
+    }
+
+    pub async fn metrics(&self) -> Value {
+        let resp = reqwest::get(self.url("/api/metrics")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json().await.unwrap()
     }
 
     pub fn url(&self, path: &str) -> String {

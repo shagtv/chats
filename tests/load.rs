@@ -42,6 +42,7 @@ async fn group_fan_out_under_load() {
         data_dir: tmp.path().to_path_buf(),
         static_dir: common::static_dir(),
         shards: None,
+        metrics: false,
     })
     .await
     .unwrap();

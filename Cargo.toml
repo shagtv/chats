@@ -26,3 +26,7 @@ tracing-subscriber = "0.3.23"
 reqwest = { version = "0.13.5", features = ["json", "cookies"] }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
+tower = { version = "0.5.3", features = ["util"] }
+
+[workspace]
+members = [".", "stress"]
