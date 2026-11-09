@@ -117,7 +117,7 @@ Loads double until a step fails, then bisect to within 5%. Phases:
 
 ```sh
 cargo build --release --workspace
-./target/release/chats-stress                  # full run, about 25 minutes
+./target/release/chats-stress                  # full run, about 35 minutes
 ./target/release/chats-stress --only b1        # one phase
 ./target/release/chats-stress --smoke --step-secs 5 --warmup-secs 2   # quick check, about 2 minutes
 ```
@@ -142,7 +142,17 @@ In a terminal it redraws a status panel every second (users, chat totals and lar
 
 **Reading the report:** "limited by" names the failed target plus the likely bottleneck read from `/api/metrics` (a hot shard writer, the meta writer, WebSocket fan-out, or server CPU). If the generator itself was above 70% of its threads, the result says *load generator*, so it measures the tool, not the server. *Product cap* means the limit was reached without failing.
 
-**Ports:** every WebSocket uses an ephemeral port, so connections from 127.0.0.1 stop at about 13,700. Each extra loopback alias adds about 14,700 more, and the tool detects them automatically:
+**Results on an Apple M5 Max (18 cores, 48 GB), one loopback address**, full run of 2,073 s with release builds. The generator peaked at 45% of its budget, so no result was limited by the tool:
+
+| Measure | Maximum | Limited by |
+|---|---|---|
+| Online users, realistic mix (A) | 12,185 | OS ports; delivery p99 under 10 ms at the top step |
+| Online viewers in one channel (B1) | 10,000 | product cap, no failure (30k frames/s, delivery p99 57 ms) |
+| One group (B2) | 1,000 online members / 800 concurrent posters | resyncs above that: about 800k frames/s overflows the 256-frame per-chat broadcast buffer |
+| Sustained writes (B3) | about 23,900 msg/s | throughput target; the `meta.db` writer queue (read position updated on every post) climbs to about 500 |
+| Idle connections (B4) | 12,185 | OS ports |
+
+**Ports:** every WebSocket uses an ephemeral port, so WebSocket connections from 127.0.0.1 stop at about 12,200 (2,560 ports are kept for the shared HTTP pool). Each extra loopback alias adds about 14,700 more, and the tool detects them automatically:
 
 ```sh
 sudo ifconfig lo0 alias 127.0.0.2 up    # remove with: sudo ifconfig lo0 -alias 127.0.0.2

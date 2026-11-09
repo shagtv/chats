@@ -94,6 +94,8 @@ pub struct Stats {
     http_us: Vec<Hist>,
     eps: Vec<EpCounters>,
     pub frames: AtomicU64,
+    /// Failures caused by this machine running out of ports.
+    pub local_failures: AtomicU64,
     pub ws_disconnects: AtomicU64,
     pub resync_frames: AtomicU64,
     pub choice_my: AtomicU64,
@@ -115,6 +117,7 @@ impl Default for Stats {
             http_us: Ep::ALL.iter().map(|_| Hist::default()).collect(),
             eps: Ep::ALL.iter().map(|_| EpCounters::default()).collect(),
             frames: AtomicU64::new(0),
+            local_failures: AtomicU64::new(0),
             ws_disconnects: AtomicU64::new(0),
             resync_frames: AtomicU64::new(0),
             choice_my: AtomicU64::new(0),
@@ -145,6 +148,12 @@ impl Stats {
     /// Calls that never got an answer (timeouts, connection errors).
     pub fn record_failure(&self, ep: Ep) {
         self.eps[ep.idx()].err.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A failure that never reached the server because no local port was free.
+    pub fn record_local_failure(&self, ep: Ep) {
+        self.record_failure(ep);
+        self.local_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn window_id(&self) -> u64 {
@@ -197,6 +206,7 @@ impl Stats {
             err,
             accepted,
             frames: self.frames.load(Ordering::Relaxed),
+            local_failures: self.local_failures.load(Ordering::Relaxed),
             ws_disconnects: self.ws_disconnects.load(Ordering::Relaxed),
             resync_frames: self.resync_frames.load(Ordering::Relaxed),
             choice_my: self.choice_my.load(Ordering::Relaxed),
@@ -226,6 +236,7 @@ pub struct Counters {
     pub err: [u64; 9],
     pub accepted: [u64; 9],
     pub frames: u64,
+    pub local_failures: u64,
     pub ws_disconnects: u64,
     pub resync_frames: u64,
     pub choice_my: u64,
@@ -242,6 +253,7 @@ impl Counters {
             d.accepted[i] -= earlier.accepted[i];
         }
         d.frames -= earlier.frames;
+        d.local_failures -= earlier.local_failures;
         d.ws_disconnects -= earlier.ws_disconnects;
         d.resync_frames -= earlier.resync_frames;
         d.choice_my -= earlier.choice_my;
@@ -274,6 +286,11 @@ impl Counters {
 
     pub fn error_rate(&self) -> f64 {
         ratio(self.failures(), self.attempts())
+    }
+
+    /// Share of failures that were local port exhaustion.
+    pub fn local_share(&self) -> f64 {
+        ratio(self.local_failures, self.failures())
     }
 
     pub fn reads(&self) -> u64 {
@@ -361,6 +378,11 @@ mod tests {
         s.frames.fetch_add(7, Ordering::Relaxed);
         let d = s.counters().since(&a);
         assert_eq!((d.ok(Ep::History), d.frames, d.reads()), (1, 7, 1));
+        s.record_failure(Ep::Post);
+        s.record_local_failure(Ep::Post);
+        let d = s.counters().since(&a);
+        assert_eq!((d.failures(), d.local_failures), (2, 1));
+        assert!((d.local_share() - 0.5).abs() < 1e-9);
     }
 
     #[test]

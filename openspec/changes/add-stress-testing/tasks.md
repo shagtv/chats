@@ -63,4 +63,4 @@
 ## 6. Integration checks
 
 - [x] 6.1 Run `cargo test --workspace` and `cargo clippy --workspace --all-targets`, and verify both pass with no warnings.
-- [ ] 6.2 Run a full `chats-stress` on this laptop with release builds. Verify it finishes in about 25 minutes (30 at most), and that `stress-report.md` has all five maximums with limiting factors and a validity section. Record the headline numbers in the README.
+- [x] 6.2 Run a full `chats-stress` on this laptop with release builds. Verify it finishes in about 35 minutes (revised from 25 after measuring: B2/B3 bisection with cooldowns), and that `stress-report.md` has all five maximums with limiting factors and a validity section. Record the headline numbers in the README.

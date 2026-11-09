@@ -23,6 +23,8 @@ pub const JOIN_SHARE: f64 = 0.10;
 pub const LEAVE_SHARE: f64 = 0.20;
 pub const OCCASIONAL_EVERY: Duration = Duration::from_secs(120);
 pub const HEAVY_EVERY: Duration = Duration::from_secs(10);
+/// Longest a virtual user goes without checking that its socket is alive.
+pub const ALIVE_CHECK: Duration = Duration::from_secs(1);
 const BODY: &str = "stress test message of a typical chat length, around sixty characters";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,8 +248,21 @@ pub async fn realistic(env: Env, index: usize, session: Session, mut stop: watch
                 (true, Some(d)) => d.min(left),
                 _ => left,
             };
-            if !pause(&mut stop, wait).await {
-                break 'session;
+            // Sleep in short slices, reconnecting if the socket dropped.
+            let wake = Instant::now() + wait;
+            while Instant::now() < wake {
+                if !pause(&mut stop, wake.saturating_duration_since(Instant::now()).min(ALIVE_CHECK * 5)).await {
+                    break 'session;
+                }
+                if !ws.alive() {
+                    match connect(&env, &session, &mut stop).await {
+                        Some(w) => {
+                            ws = w;
+                            ws.open(chat.id).await;
+                        }
+                        None => break 'session,
+                    }
+                }
             }
             if chat.can_post
                 && Instant::now() < until
@@ -275,6 +290,7 @@ pub async fn viewer(env: Env, session: Session, chat: i64, post_every: Option<Du
     ws.open(chat).await;
     let _ = env.api.history(&session, chat, None, None).await;
     let mut posted_window = 0;
+    let mut next_post = Instant::now();
     loop {
         if !ws.alive() {
             match connect(&env, &session, &mut stop).await {
@@ -285,12 +301,18 @@ pub async fn viewer(env: Env, session: Session, chat: i64, post_every: Option<Du
                 None => break,
             }
         }
-        let wait = post_every.unwrap_or(Duration::from_secs(3600));
+        // Wake at least once a second so a dropped socket is noticed quickly.
+        let wait = post_every.unwrap_or(ALIVE_CHECK).min(ALIVE_CHECK);
         if !pause(&mut stop, wait).await {
             break;
         }
-        if post_every.is_some() && env.api.post(&session, chat, BODY).await.is_ok() {
-            env.api.stats.note_poster(&mut posted_window);
+        if let Some(every) = post_every
+            && next_post.elapsed() >= every
+        {
+            next_post = Instant::now();
+            if env.api.post(&session, chat, BODY).await.is_ok() {
+                env.api.stats.note_poster(&mut posted_window);
+            }
         }
     }
     ws.close().await;

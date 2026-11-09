@@ -73,6 +73,17 @@ The tool SHALL raise load in steps. Each step is a warm-up that isn't measured, 
 - **WHEN** every target is met during a step's window
 - **THEN** the step is marked passed
 
+### Requirement: Throughput target for rate-driven phases
+In a phase whose load is a target message rate (B3), a step SHALL also fail if the rate of accepted posts during its window is below 90% of the target. Closed-loop posters slow down instead of erroring when the server saturates, so without this rule the ramp would never stop.
+
+#### Scenario: Saturated server misses the target rate
+- **WHEN** a B3 step targets 32,000 msg/s, achieves 25,500 msg/s, and meets every latency and error target
+- **THEN** the step is marked failed, with throughput named as the reason
+
+#### Scenario: Target rate reached
+- **WHEN** a B3 step targets 8,000 msg/s and achieves 7,900 msg/s with every other target met
+- **THEN** the step passes
+
 ### Requirement: Adaptive ramp
 Each phase's ramp SHALL double its load per step until a step fails, then bisect between the last passing and the first failing load until they are within 5% of each other or 4 bisection steps have run. The phase's maximum is its highest passing load.
 

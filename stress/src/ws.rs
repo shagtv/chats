@@ -85,12 +85,16 @@ pub async fn connect(api: &Arc<Api>, ports: &Arc<Ports>, session: &Session) -> R
     let result = handshake(api.server, src, &session.cookie).await;
     stats.connecting.fetch_sub(1, Ordering::Relaxed);
     let socket = match result {
-        Some(s) => {
+        Ok(s) => {
             stats.record_call(Ep::WsConnect, session.id as usize, start.elapsed().as_micros() as u64, true, true);
             s
         }
-        None => {
-            stats.record_failure(Ep::WsConnect);
+        Err(local) => {
+            if local {
+                stats.record_local_failure(Ep::WsConnect);
+            } else {
+                stats.record_failure(Ep::WsConnect);
+            }
             ports.release();
             return Err(ConnectError::Failed);
         }
@@ -102,15 +106,17 @@ pub async fn connect(api: &Arc<Api>, ports: &Arc<Ports>, session: &Session) -> R
     Ok(Ws { sink, reader, closing })
 }
 
-async fn handshake(server: SocketAddr, src: std::net::IpAddr, cookie: &str) -> Option<WebSocketStream<TcpStream>> {
-    let socket = TcpSocket::new_v4().ok()?;
-    socket.bind(SocketAddr::new(src, 0)).ok()?;
-    let stream = socket.connect(server).await.ok()?;
-    stream.set_nodelay(true).ok()?;
-    let mut req = format!("ws://{server}/api/ws").into_client_request().ok()?;
-    req.headers_mut().insert("cookie", cookie.parse().ok()?);
-    let (ws, _) = tokio_tungstenite::client_async(req, stream).await.ok()?;
-    Some(ws)
+/// `Err(true)` when the failure was local port exhaustion.
+async fn handshake(server: SocketAddr, src: std::net::IpAddr, cookie: &str) -> Result<WebSocketStream<TcpStream>, bool> {
+    let local = |e: std::io::Error| crate::net::io_is_local(&e);
+    let socket = TcpSocket::new_v4().map_err(local)?;
+    socket.bind(SocketAddr::new(src, 0)).map_err(local)?;
+    let stream = socket.connect(server).await.map_err(local)?;
+    stream.set_nodelay(true).map_err(local)?;
+    let mut req = format!("ws://{server}/api/ws").into_client_request().map_err(|_| false)?;
+    req.headers_mut().insert("cookie", cookie.parse().map_err(|_| false)?);
+    let (ws, _) = tokio_tungstenite::client_async(req, stream).await.map_err(|_| false)?;
+    Ok(ws)
 }
 
 /// Decrements `online` and frees the port when the reader ends, however it ends.

@@ -3,8 +3,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Ports kept free on the first address for the shared HTTP pool and slack.
-pub const HTTP_RESERVE: usize = 1024;
+/// Connections the shared HTTP pool keeps open; enough for every concurrent
+/// poster, so requests reuse connections instead of churning ports.
+pub const HTTP_POOL: usize = 2048;
+/// Ports kept free on the first address for the HTTP pool and slack.
+pub const HTTP_RESERVE: usize = HTTP_POOL + 512;
 const MAX_ALIASES: u8 = 16;
 
 /// Which loopback addresses can be bound as a source (127.0.0.1 always; the
@@ -92,6 +95,24 @@ impl Ports {
     }
 }
 
+/// Whether an error means this machine ran out of ephemeral ports (or the
+/// source address can't be used), as opposed to the server failing.
+pub fn is_local_port_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return io_is_local(io);
+        }
+        cur = e.source();
+    }
+    false
+}
+
+pub fn io_is_local(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{AddrInUse, AddrNotAvailable};
+    matches!(e.kind(), AddrNotAvailable | AddrInUse)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +141,26 @@ mod tests {
         p.release();
         assert!(p.acquire().is_some());
         assert_eq!(p.used(), 4);
+    }
+
+    #[test]
+    fn classifies_local_port_errors() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrapped")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let local = Wrapper(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable));
+        let refused = Wrapper(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(is_local_port_error(&local));
+        assert!(!is_local_port_error(&refused), "a refused connection is the server's side");
     }
 
     #[test]

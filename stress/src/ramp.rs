@@ -8,6 +8,8 @@ pub const HTTP_P99_MS: f64 = 500.0;
 pub const MAX_ERROR_RATE: f64 = 0.01;
 pub const MAX_RESYNC_RATE: f64 = 0.01;
 pub const EARLY_FAIL_ERROR_RATE: f64 = 0.10;
+/// Rate-driven steps must achieve this share of their target rate.
+pub const MIN_THROUGHPUT_SHARE: f64 = 0.90;
 pub const MAX_BISECTIONS: u32 = 4;
 pub const CONVERGED_WITHIN: f64 = 0.05;
 
@@ -18,6 +20,8 @@ pub struct Measured {
     pub http_p99_ms: Option<f64>,
     pub error_rate: f64,
     pub resync_rate: f64,
+    /// For rate-driven phases: (target msg/s, accepted msg/s).
+    pub throughput: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -26,6 +30,7 @@ pub enum Target {
     Http,
     Errors,
     Resyncs,
+    Throughput,
 }
 
 impl Target {
@@ -35,6 +40,10 @@ impl Target {
             Target::Http => format!("HTTP p99 {:.0} ms > {HTTP_P99_MS:.0} ms", m.http_p99_ms.unwrap_or(0.0)),
             Target::Errors => format!("errors {:.2}% > {:.0}%", m.error_rate * 100.0, MAX_ERROR_RATE * 100.0),
             Target::Resyncs => format!("resyncs {:.2}% > {:.0}%", m.resync_rate * 100.0, MAX_RESYNC_RATE * 100.0),
+            Target::Throughput => {
+                let (target, got) = m.throughput.unwrap_or_default();
+                format!("throughput {got:.0} of {target:.0} msg/s < {:.0}%", MIN_THROUGHPUT_SHARE * 100.0)
+            }
         }
     }
 }
@@ -54,6 +63,9 @@ pub fn evaluate(m: &Measured) -> Vec<Target> {
     }
     if m.resync_rate > MAX_RESYNC_RATE {
         failed.push(Target::Resyncs);
+    }
+    if m.throughput.is_some_and(|(target, got)| got < MIN_THROUGHPUT_SHARE * target) {
+        failed.push(Target::Throughput);
     }
     failed
 }
@@ -121,7 +133,7 @@ impl Ramp {
                 if self.limit.is_some_and(|l| pass >= l) {
                     return Next::Done(Stop::Ports);
                 }
-                Next::Step((pass * 2).min(self.ceiling()))
+                Next::Step(pass.saturating_mul(2).min(self.ceiling()))
             }
             (pass, Some(fail)) => {
                 let lo = pass.unwrap_or(0);
@@ -153,8 +165,12 @@ pub struct Evidence {
     pub shard_queue_max_shard: u64,
     pub shard_queue_growing: bool,
     pub meta_queue_max: u64,
+    /// Share of the step's failures that were local port exhaustion.
+    pub local_failure_share: f64,
 }
 
+/// Above this share of local failures, a failed step is the OS's limit.
+pub const LOCAL_PORTS_SHARE: f64 = 0.5;
 pub const GEN_BOUND_SHARE: f64 = 0.70;
 pub const SERVER_CPU_SHARE: f64 = 0.85;
 pub const QUEUE_HOT: u64 = 500;
@@ -167,6 +183,12 @@ pub fn limiting_factor(stop: Stop, e: Option<&Evidence>, alias_hint: &str) -> St
         Stop::Failed => {}
     }
     let Some(e) = e else { return "unknown".into() };
+    if e.failed.contains(&Target::Errors) && e.local_failure_share > LOCAL_PORTS_SHARE {
+        return format!(
+            "OS ephemeral ports: {:.0}% of failures were local port exhaustion (add a loopback alias: `{alias_hint}`)",
+            e.local_failure_share * 100.0
+        );
+    }
     if e.gen_cpu_share > GEN_BOUND_SHARE {
         return "load generator (its CPU was above 70% of its threads)".into();
     }
@@ -175,6 +197,7 @@ pub fn limiting_factor(stop: Stop, e: Option<&Evidence>, alias_hint: &str) -> St
         Target::Http => "HTTP latency",
         Target::Errors => "error rate",
         Target::Resyncs => "resync rate",
+        Target::Throughput => "throughput",
     });
     let hint = if e.shard_queue_max > QUEUE_HOT || e.shard_queue_growing {
         format!("hot shard writer (shard #{})", e.shard_queue_max_shard)
@@ -195,7 +218,7 @@ mod tests {
     use super::*;
 
     fn ok() -> Measured {
-        Measured { delivery_p99_ms: Some(100.0), http_p99_ms: Some(50.0), error_rate: 0.0, resync_rate: 0.0 }
+        Measured { delivery_p99_ms: Some(100.0), http_p99_ms: Some(50.0), error_rate: 0.0, resync_rate: 0.0, throughput: None }
     }
 
     #[test]
@@ -206,11 +229,14 @@ mod tests {
             (Measured { http_p99_ms: Some(501.0), ..ok() }, Target::Http),
             (Measured { error_rate: 0.02, ..ok() }, Target::Errors),
             (Measured { resync_rate: 0.011, ..ok() }, Target::Resyncs),
+            (Measured { throughput: Some((32_000.0, 25_500.0)), ..ok() }, Target::Throughput),
         ];
         for (m, t) in &cases {
             assert_eq!(evaluate(m), vec![*t]);
         }
         assert_eq!(Target::Delivery.describe(&cases[0].0), "delivery p99 1400 ms > 1000 ms");
+        assert_eq!(Target::Throughput.describe(&cases[4].0), "throughput 25500 of 32000 msg/s < 90%");
+        assert!(evaluate(&Measured { throughput: Some((8_000.0, 7_900.0)), ..ok() }).is_empty(), "within 90%");
         // No samples (idle phase) is not a failure.
         assert!(evaluate(&Measured::default()).is_empty());
     }
@@ -259,6 +285,12 @@ mod tests {
     }
 
     #[test]
+    fn doubling_saturates() {
+        let mut r = Ramp::new(u64::MAX / 2 + 1, None, None);
+        assert_eq!(r.record(u64::MAX / 2 + 1, true), Next::Step(u64::MAX));
+    }
+
+    #[test]
     fn first_step_failing_bisects_down() {
         let (loads, stop, max) = drive(Ramp::new(1000, None, None), 300);
         assert_eq!(loads[0], 1000);
@@ -284,5 +316,10 @@ mod tests {
         let cpu = Evidence { server_cpu_share: 0.95, ..base.clone() };
         assert!(limiting_factor(Stop::Failed, Some(&cpu), hint).ends_with("server CPU"));
         assert!(limiting_factor(Stop::Failed, Some(&base), hint).ends_with("unknown"));
+        let ports = Evidence { failed: vec![Target::Errors], local_failure_share: 0.9, gen_cpu_share: 0.95, ..base.clone() };
+        let text = limiting_factor(Stop::Failed, Some(&ports), hint);
+        assert!(text.starts_with("OS ephemeral ports: 90%") && text.contains(hint), "port exhaustion wins: {text}");
+        let mostly_server = Evidence { local_failure_share: 0.2, ..ports.clone() };
+        assert!(limiting_factor(Stop::Failed, Some(&mostly_server), hint).starts_with("load generator"));
     }
 }

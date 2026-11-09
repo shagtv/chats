@@ -36,6 +36,10 @@ const SMOKE_USERS: usize = 1_000;
 const SMOKE_B1_SIZE: usize = 300;
 const SMOKE_B3_CHATS: usize = 50;
 const SMOKE_STEPS: u32 = 2;
+/// Pause after a failed step so sockets left in TIME_WAIT expire and don't
+/// spoil the next step.
+const COOLDOWN_SECS: u64 = 30;
+const SMOKE_COOLDOWN_SECS: u64 = 3;
 
 /// A set of virtual-user tasks that can grow or shrink (newest stop first).
 pub struct Population {
@@ -323,7 +327,7 @@ async fn run_phase(ctx: &Arc<Ctx>, phase: Phase, pool: &mut Vec<Session>) -> Res
             let rate = Arc::new(AtomicU64::new(B2_POST_MHZ));
             let viewers = Population::new(move |i, stop| tokio::spawn(user::viewer(env.clone(), sessions[i].clone(), chat, None, stop)));
             let posters = Population::new(move |i, stop| tokio::spawn(user::poster(env2.clone(), s2[i].clone(), chat, rate.clone(), stop)));
-            (Driver::GroupPosters { viewers, posters }, 10, Some(seed::GROUP_CAP as u64), None, "posters")
+            (Driver::GroupPosters { viewers, posters }, 50, Some(seed::GROUP_CAP as u64), None, "posters")
         }
         Phase::B3 => {
             let users = b3_chats * B3_SIZE;
@@ -357,6 +361,7 @@ async fn run_phase(ctx: &Arc<Ctx>, phase: Phase, pool: &mut Vec<Session>) -> Res
     let mut steps = Vec::new();
     let mut evidence: Option<Evidence> = None;
     let mut step_no = 0;
+    let mut cool_down = false;
     let stop = loop {
         match next {
             Next::Done(stop) => break stop,
@@ -369,7 +374,12 @@ async fn run_phase(ctx: &Arc<Ctx>, phase: Phase, pool: &mut Vec<Session>) -> Res
                     l.state = "ramping".into();
                 });
                 let conns = driver.apply(load).await;
-                let Some((result, ev)) = measure_step(ctx, conns).await else { break Stop::Failed };
+                if cool_down && !cooldown(ctx).await {
+                    break Stop::Failed;
+                }
+                let target_rate = matches!(driver, Driver::WriteRate { .. }).then_some(load as f64);
+                let Some((result, ev)) = measure_step(ctx, conns, target_rate).await else { break Stop::Failed };
+                cool_down = !result.passed;
                 next = ramp.record(load, result.passed);
                 if !result.passed {
                     evidence = Some(ev);
@@ -410,8 +420,27 @@ async fn run_phase(ctx: &Arc<Ctx>, phase: Phase, pool: &mut Vec<Session>) -> Res
     })
 }
 
+/// Waits out the cooldown after a failed step; `false` if interrupted.
+async fn cooldown(ctx: &Arc<Ctx>) -> bool {
+    let secs = if ctx.args.smoke { SMOKE_COOLDOWN_SECS } else { COOLDOWN_SECS };
+    set_live(ctx, |l| {
+        l.state = "cooldown".into();
+        l.window_s = 0;
+        l.window_total_s = secs;
+    });
+    for s in 1..=secs {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        set_live(ctx, |l| l.window_s = s);
+        if ctx.interrupted.load(Ordering::Relaxed) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Waits for connections, warms up, measures one window. `None` if interrupted.
-async fn measure_step(ctx: &Arc<Ctx>, conns: usize) -> Option<(StepResult, Evidence)> {
+/// `target_rate`: for rate-driven phases, the msg/s the step must achieve.
+async fn measure_step(ctx: &Arc<Ctx>, conns: usize, target_rate: Option<f64>) -> Option<(StepResult, Evidence)> {
     let stats = &ctx.stats;
     let interrupted = || ctx.interrupted.load(Ordering::Relaxed);
     set_live(ctx, |l| l.state = "connecting".into());
@@ -475,6 +504,7 @@ async fn measure_step(ctx: &Arc<Ctx>, conns: usize) -> Option<(StepResult, Evide
         http_p99_ms: http.map(|h| h.1),
         error_rate: delta.error_rate(),
         resync_rate: if online > 0.0 { stats.window_resynced() as f64 / online } else { 0.0 },
+        throughput: target_rate.map(|t| (t, delta.accepted(Ep::Post) as f64 / secs)),
     };
     let mut failed = ramp::evaluate(&measured);
     if early && !failed.contains(&Target::Errors) {
@@ -504,6 +534,7 @@ async fn measure_step(ctx: &Arc<Ctx>, conns: usize) -> Option<(StepResult, Evide
         shard_queue_max_shard: queue_shard,
         shard_queue_growing: growing,
         meta_queue_max: seconds.iter().map(|s| s.meta_queue).max().unwrap_or(0),
+        local_failure_share: delta.local_share(),
     };
     let result = StepResult {
         load: 0,
@@ -522,7 +553,15 @@ async fn measure_step(ctx: &Arc<Ctx>, conns: usize) -> Option<(StepResult, Evide
         shard_queue_max: queue_max,
         meta_queue_max: evidence.meta_queue_max,
         passed: failed.is_empty(),
-        reasons: failed.iter().map(|t| t.describe(&measured)).collect(),
+        reasons: failed
+            .iter()
+            .map(|t| match t {
+                Target::Errors if delta.local_failures > 0 => {
+                    format!("{} ({:.0}% local port exhaustion)", t.describe(&measured), delta.local_share() * 100.0)
+                }
+                _ => t.describe(&measured),
+            })
+            .collect(),
         early,
     };
     Some((result, evidence))

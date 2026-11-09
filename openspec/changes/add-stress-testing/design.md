@@ -57,7 +57,7 @@ Each virtual user (VU) is one tokio task holding its session cookie, its current
 
 The generator runs on a multi-thread runtime with `--gen-threads N` workers. The default is 6, one third of the cores, which leaves the rest to the server. "Cores available to it" in the run-validity requirement means these N threads, so the generator-bound threshold is 70% × N cores.
 
-**HTTP:** one shared `reqwest::Client` for all VUs, with `pool_max_idle_per_host` at 512 and the cookie header set per request instead of a cookie store per VU. HTTP then uses hundreds of sockets in total rather than one per user, which leaves the ephemeral ports for WebSockets.
+**HTTP:** one shared `reqwest::Client` for all VUs, with `pool_max_idle_per_host` at 2,048 and the cookie header set per request instead of a cookie store per VU. The pool is large enough for every concurrent poster (B3 runs 1,000), so requests reuse connections. With a smaller pool, the extra connections are opened and closed per request, and at thousands of requests per second their TIME_WAIT sockets exhaust the ephemeral ports. The first full run showed exactly that with a 512-connection pool. The pool's 2,048 ports plus 512 of slack are reserved on 127.0.0.1, which leaves about 12,200 for WebSockets.
 
 **WebSocket:**
 - Each WebSocket is made with `tokio::net::TcpSocket`, bound to a chosen loopback source address, then `tokio_tungstenite::client_async`.
@@ -81,7 +81,7 @@ Restarting and reseeding per phase would add minutes, so the tool starts one ser
 ### D6. Seeding
 Users are registered concurrently, with at most 2 × cores requests in flight, before any measured step. Because the server's argon2 hashing is the bottleneck, seeding 40k users takes about a minute.
 
-The realistic phase seeds `users / 20` chats, with memberships drawn from a Zipf distribution (s ≈ 1.1). Each user joins 3 to 8 chats. The most popular ranks are made channels, so the Zipf head can exceed 1,000 members without hitting the group cap. Draws that would exceed a cap are drawn again.
+The realistic phase seeds `users / 20` chats, with memberships drawn from a Zipf distribution (s = 1.2, which puts more than 30% of memberships in the top 1% of chats). Each user joins 3 to 8 chats. The most popular ranks are made channels, so the Zipf head can exceed 1,000 members without hitting the group cap. Draws that would exceed a cap are drawn again.
 
 Probe phases seed exactly what they need:
 - **B1:** one channel with 10,000 members
@@ -98,7 +98,7 @@ Each phase is described by `PhaseSpec { start, cap, unit, apply(load) }`:
 |---|---|---|
 | A | sets the number of online realistic VUs | 1,000, none |
 | B1 | sets online viewers of the channel; the owner posts at 2 msg/s | 1,000, 10,000 |
-| B2 | fills the group to 1,000 online members, then sets the number of posters (each 1 msg/s) | 10, 1,000 |
+| B2 | fills the group to 1,000 online members, then sets the number of posters (each 1 msg/s) | 50, 1,000 |
 | B3 | sets the target total msg/s, spread over the small groups with paced posters | 500, none |
 | B4 | sets the number of connected idle VUs | 2,000, none |
 
@@ -113,6 +113,14 @@ If more than 10% of requests fail in the first 10 s of a window, the step is fai
 **Next load:** double it until the first failure, then bisect `(last_pass + first_fail) / 2` until they are within 5% of each other or 4 bisection steps have run. Reaching the cap ends the phase with the cap as the limit. So does needing more connections than the ports allow, with the OS port limit as the limit.
 
 Ramping down for a bisection step disconnects the newest VUs first.
+
+B3 also has a throughput target: a step fails if accepted posts reach less than 90% of the target rate. Posters are closed-loop (each waits for its reply before posting again), so a saturated server just slows them down without missing any latency or error target. The first B3 rerun after the port fix kept passing up to a target of 268 billion msg/s while achieving about 25,000. Loads also double with saturating arithmetic.
+
+After a failed step, the next step applies its load and then waits a 30 s cooldown before connecting and warming up. That lets TIME_WAIT sockets left by the failure expire, so one failure doesn't spoil the steps that bisect below it.
+
+Virtual users check that their socket is alive at least once a second (every 5 s while a realistic user dwells) and reconnect if it dropped.
+
+`--smoke` (not a measurement mode) divides starting loads by 10, seeds at most 1,000 users, uses smaller B1/B3 layouts, cools down for 3 s, and stops each phase after 2 steps. It exists so the whole pipeline can be checked in about 2 minutes.
 
 ### D8. Process sampling
 Every second the tool runs `ps -o time=,rss= -p <server_pid>,<own_pid>`. It takes the difference in cumulative CPU time to get exact per-second CPU%. The `%cpu` column on macOS is a decaying average, so it is avoided.
@@ -129,10 +137,11 @@ Each second's sample is a serde struct, which serves both as a CSV row in `stres
 
 ### D10. Limiting-factor rules
 Each phase's maximum gets a limiting factor. The first rule that matches wins:
-1. Generator CPU above 70% of `--gen-threads` cores during the failing window: **load generator**.
-2. Stopped for port capacity: **OS ephemeral ports**, with the `sudo ifconfig lo0 alias 127.0.0.N up` command for the next free N.
-3. Reached the cap while passing: **product cap**.
-4. Otherwise, the failed target, plus a hint:
+1. Stopped for port capacity: **OS ephemeral ports**, with the `sudo ifconfig lo0 alias 127.0.0.N up` command for the next free N.
+2. Reached the cap while passing: **product cap**.
+3. The step failed on errors, and more than half of its failures were local port exhaustion (`AddrNotAvailable`/`AddrInUse` on connect): **OS ephemeral ports**, with the alias command.
+4. Generator CPU above 70% of `--gen-threads` cores during the failing window: **load generator**.
+5. Otherwise, the failed target, plus a hint:
    - `writers.shards.queue_max` above 500, or growing for the whole window: **hot shard writer (shard #k)**
    - `writers.meta.queue` above 500: **meta writer**
    - the resync target failed: **WebSocket fan-out / slow consumers**

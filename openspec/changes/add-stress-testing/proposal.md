@@ -37,7 +37,7 @@ We know the server handles a full 1,000-member group at a fixed load, but not wh
 
   Without a terminal it prints one summary line every 5 seconds. Every second's numbers are also written to `stress-timeline.csv`.
 - At the end it writes `stress-report.md` and `stress-report.json`. They include a table of maximums, saying what limited each one (a target, a product cap, the OS port limit, or the load generator itself), a row per step for every phase, and a run-validity section.
-- A full run takes about 25 minutes.
+- A full run takes about 35 minutes. The first estimate was 25; phases that bisect (B2, B3) add a 30 s cooldown per failed step.
 
 ## Capabilities
 

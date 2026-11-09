@@ -86,7 +86,7 @@ pub struct Api {
 impl Api {
     pub fn new(server: SocketAddr, stats: Arc<Stats>) -> Api {
         let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(512)
+            .pool_max_idle_per_host(crate::net::HTTP_POOL)
             .timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
             .build()
@@ -113,8 +113,12 @@ impl Api {
         let start = Instant::now();
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(_) => {
-                self.stats.record_failure(ep);
+            Err(e) => {
+                if crate::net::is_local_port_error(&e) {
+                    self.stats.record_local_failure(ep);
+                } else {
+                    self.stats.record_failure(ep);
+                }
                 return Err(CallError::Transport);
             }
         };
